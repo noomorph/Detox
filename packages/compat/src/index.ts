@@ -51,7 +51,7 @@ import {
 } from 'detox/client';
 import { getBundleIdFromBinary } from './bundle-id';
 import { type LaunchArgs } from './launch-args';
-import { compatStateBox, type CompatState, type ResolvedCompatApp } from './state';
+import { compatStateBox, sharedSurface, type CompatState, type ResolvedCompatApp } from './state';
 import {
   normalizeURLBlacklist,
   serializeURLBlacklistForIOS,
@@ -296,6 +296,7 @@ async function doInit(config: CompatConfig, signal?: AbortSignal): Promise<void>
     ...(config.allocationTimeout !== undefined ? { allocationTimeout: config.allocationTimeout } : {}),
     signal,
     ambient: () => box.ambient,
+    onCall: (method: string, call: Promise<unknown>) => box.onCall?.(method, call),
     unrefSocket: box.unrefSocket,
   };
   const session = await connectClient(initOptions);
@@ -567,9 +568,10 @@ async function launchAppImpl(
 /**
  * The `device` global: one stable object whose methods look up the live
  * state per call — so a body that captured it before `init()` (as v20's own
- * `setup.js` does at module load) still works after.
+ * `setup.js` does at module load) still works after. One object per realm
+ * (spec 021): a test file's `require('detox').device` is the global.
  */
-export const device = {
+export const device = sharedSurface('device', {
   /** v20 exposes the platform synchronously; this server is iOS-only today. */
   getPlatform: (): 'ios' => 'ios',
 
@@ -860,7 +862,7 @@ export const device = {
    * becomes a wire call and it holds no server state.
    */
   appLaunchArgs: box.launchArgsEditor,
-};
+});
 
 /**
  * The `element` global: routes to the current app's handle,
@@ -927,7 +929,7 @@ interface LateBoundElement {
   [RESOLVE_ELEMENT]: () => AppElement;
 }
 
-export const element = (matcher: AppMatcher): AppElement => {
+export const element = sharedSurface('element', (matcher: AppMatcher): AppElement => {
   // @issue DTX-4028: v20's `atIndex` mutates the element and returns it — the index belongs
   // to the stand-in, not to any one resolved element.
   let index: number | undefined;
@@ -985,7 +987,7 @@ export const element = (matcher: AppMatcher): AppElement => {
     },
   });
   return proxy;
-};
+});
 
 /** Unwraps `element()`'s late-bound stand-in for the client's own `expect`/`waitFor`. */
 function resolveElement(target: AppElement): AppElement {
@@ -1005,13 +1007,13 @@ const unwrapElement = (value: unknown): unknown =>
     : value;
 
 /** The `by` global: stateless predicate data, straight from the v21 client. */
-export const by = statelessBy;
+export const by = sharedSurface('by', statelessBy);
 
 /** The `expect` global (element expectations only — suites import Jest's separately). */
-const expectElement = (target: AppElement): AppExpectation =>
-  withV20Errors(requireLaunchedApp('expect').expect(resolveElement(target)), unwrapElement);
+const expectElement = sharedSurface('expect', (target: AppElement): AppExpectation =>
+  withV20Errors(requireLaunchedApp('expect').expect(resolveElement(target)), unwrapElement));
 export { expectElement as expect };
 
 /** The `waitFor` global. */
-export const waitFor = (target: AppElement): AppWaitFor =>
-  withV20Errors(requireLaunchedApp('waitFor').waitFor(resolveElement(target)), unwrapElement);
+export const waitFor = sharedSurface('waitFor', (target: AppElement): AppWaitFor =>
+  withV20Errors(requireLaunchedApp('waitFor').waitFor(resolveElement(target)), unwrapElement));

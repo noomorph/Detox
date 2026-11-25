@@ -18,6 +18,18 @@ function makeClientAndServerPeers() {
 }
 
 describe('DetoxClientPeer', () => {
+  it('tells onCall of every request as it goes out, with its wire method (spec 020)', async () => {
+    const [clientChannel, serverChannel] = memoryChannel();
+    const calls: Array<[string, Promise<unknown>]> = [];
+    const client = new DetoxClientPeer({ peer: Peer.create(clientChannel), onCall: (method, call) => calls.push([method, call]) });
+    Peer.create(serverChannel).onRequest({ method: 'terminateApp', handler: async () => undefined });
+    const pending = client.terminateApp({ allocationId: 'a1', appHandleId: 'h1' });
+    expect(calls).toEqual([['terminateApp', expect.any(Promise)]]);
+    // The caller's promise is its own: handlers the observer attaches never mark it handled.
+    expect(calls[0]?.[1]).not.toBe(pending);
+    await pending;
+  });
+
   it('wires allocateDevice to the "allocateDevice" RPC method, params in, result out', async () => {
     const { client, server } = makeClientAndServerPeers();
     let receivedMethod: string | undefined;

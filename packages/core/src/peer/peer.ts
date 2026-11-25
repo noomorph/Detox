@@ -17,8 +17,17 @@ import type {
   OnNotifyOpts,
   CallOptions,
 } from './request-context';
-import { AbortError, DetoxConnectionError, DetoxErrorCode, errorFromWire, toWireError } from '../errors';
-import type { WireError } from '../errors';
+import {
+  AbortError,
+  AbortReason,
+  DetoxConnectionError,
+  DetoxErrorCode,
+  abortKindOf,
+  errorFromWire,
+  readAbortKind,
+  toWireError,
+} from '../errors';
+import type { AbortKind, AbortWaiting, WireError } from '../errors';
 
 interface PendingCall {
   resolve: (value: unknown) => void;
@@ -56,33 +65,45 @@ const RETAIN_MS = 60_000;
 /** JSON-RPC's own "request cancelled" code — the frame that carries the outcome. */
 const JSONRPC_CANCELLED = -32800;
 
-/** What a cancellation answer said about its rollback, ready for `AbortError`'s `details`. */
+/** What a cancellation answer said, ready for `AbortError`'s `details`. */
 interface ReportedOutcome {
-  outcome: CancelOutcome;
+  outcome?: CancelOutcome;
+  waiting?: AbortWaiting;
 }
 
 /** The `data` shape `outcomeOf` reads out of a `-32800` answer, before it is trusted. */
 interface CancelledData {
   outcome?: unknown;
+  waiting?: unknown;
 }
 
 /**
- * The rollback outcome an error response carries, if it is the cancellation
- * answer and it says anything at all. The word itself is vetted by
- * {@link readOutcome} — the same reader the `$/cancelAck` path uses, because
- * one field with two validators is one field with two meanings.
+ * The rollback outcome and the handler's last stated wait an error response
+ * carries, if it is the cancellation answer and it says anything at all. The
+ * outcome word is vetted by {@link readOutcome} — the same reader the
+ * `$/cancelAck` path uses, because one field with two validators is one field
+ * with two meanings; `waiting` passes only with a string `on` and a numeric `forMs`.
  */
 function outcomeOf(error: RpcResponse['error']): ReportedOutcome | undefined {
   if (error?.code !== JSONRPC_CANCELLED) return undefined;
   const data = error.data;
   if (typeof data !== 'object' || data === null) return undefined;
   const outcome = readOutcome((data as CancelledData).outcome);
-  return outcome === undefined ? undefined : { outcome };
+  const waiting = (data as CancelledData).waiting as Partial<AbortWaiting> | null | undefined;
+  const reported: ReportedOutcome = {
+    ...(outcome !== undefined ? { outcome } : {}),
+    ...(typeof waiting?.on === 'string' && typeof waiting.forMs === 'number' ? { waiting: waiting as AbortWaiting } : {}),
+  };
+  return Object.keys(reported).length > 0 ? reported : undefined;
 }
 
-/** The `-32800` answer, carrying what the rollback did. */
-function cancelledError(outcome: CancelOutcome): WireError {
-  return { code: JSONRPC_CANCELLED, message: 'Request cancelled', data: { outcome } };
+/** The `-32800` answer: what the rollback did, why the request was cancelled, and what it was waiting for. */
+function cancelledError(outcome: CancelOutcome, reason: AbortKind, waiting: AbortWaiting | undefined): WireError {
+  return {
+    code: JSONRPC_CANCELLED,
+    message: 'Request cancelled',
+    data: { outcome, reason, ...(waiting !== undefined ? { waiting } : {}) },
+  };
 }
 
 /** @issue DTX-1012: the ceiling — retained records are dropped oldest-first once it is full. */
@@ -257,7 +278,7 @@ export class Peer {
           if (!entry || entry.aborted) return;
           entry.aborted = true;
           entry.abortReason = signal.reason;
-          this.notify({ method: '$/cancelRequest', params: { id } });
+          this.notify({ method: '$/cancelRequest', params: { id, reason: abortKindOf(signal.reason) } });
         }, { once: true });
       }
 
@@ -370,6 +391,18 @@ export class Peer {
       this.notify({ method: '$/progress', params: { token: req.id, value } });
     };
 
+    // The last stated wait, frozen when the abort lands: what the rollback does afterwards is not what was interrupted.
+    let stated: { on: string; since: number; fields?: Record<string, unknown> } | undefined;
+    let interrupted: AbortWaiting | undefined;
+    const waiting = (on: string, fields?: Record<string, unknown>): void => {
+      if (!ac.signal.aborted) stated = { on, since: Date.now(), fields };
+    };
+    ac.signal.addEventListener('abort', () => {
+      if (stated) interrupted = { ...stated.fields, on: stated.on, forMs: Date.now() - stated.since };
+    }, { once: true });
+    const cancelled = (outcome: CancelOutcome): WireError =>
+      cancelledError(outcome, abortKindOf(ac.signal.reason), interrupted);
+
     const undo = new UndoStack((error) => this._onError(error));
     let ok = true;
     let error: WireError | undefined;
@@ -381,12 +414,13 @@ export class Peer {
           signal: ac.signal,
           progress,
           onUndo: (fn) => undo.push(fn),
+          waiting,
         }),
       );
       if (ac.signal.aborted) {
         ok = false;
         // The rollback runs inside the request's scope too: what it spawns is the request's.
-        error = cancelledError(await this._unwind(begin, undo));
+        error = cancelled(await this._unwind(begin, undo));
         this._sendCancelled(req.id, error);
       } else {
         // Retained *before* the response goes out, so the answer and the
@@ -400,7 +434,7 @@ export class Peer {
       const outcome = await this._unwind(begin, undo);
       ok = false;
       if (ac.signal.aborted) {
-        error = cancelledError(outcome);
+        error = cancelled(outcome);
         this._sendCancelled(req.id, error);
       } else {
         error = toWireError(err);
@@ -489,12 +523,15 @@ export class Peer {
 
   private _handleNotification(notif: RpcNotification): void {
     if (isCancelRequestNotification(notif)) {
-      const { id } = notif.params;
+      const { id, reason } = notif.params;
       const running = this._running.get(id);
       if (running) {
         // Still working: aborting it is the whole answer, and the `-32800` it
-        // produces is the acknowledgment.
-        running.abort();
+        // produces is the acknowledgment. The kind is the requester's word, vetted: the kinds
+        // only this side can know (its own timeout, its own lost connection) are never taken from the wire.
+        const kind = readAbortKind(reason);
+        const vetted = kind === undefined || kind === 'ready-timeout' || kind === 'connection-closed' ? 'caller' : kind;
+        running.abort(new AbortReason(vetted, 'cancelled by the requester'));
         return;
       }
       void this._acknowledgeLateCancel(id);

@@ -26,7 +26,10 @@ vi.mock('../../index', () => ({
   expect: () => ({}),
 }));
 
+import { AbortError } from 'detox/client';
+
 import { DetoxCircusEnvironment } from '../environment';
+import { errorListsUnder, INTERRUPTED_ANSWER_BOUND_MS } from '../interrupted';
 
 function writeSnapshotFixture(extra: Record<string, unknown> = {}): string {
   const dir = mkdtempSync(path.join(tmpdir(), 'detox-jest-env-test-'));
@@ -64,6 +67,7 @@ beforeEach(() => {
   box.ambient = undefined;
   box.unrefSocket = false;
   box.onSession = undefined;
+  box.onCall = undefined;
   process.env.DETOX_CONFIG_SNAPSHOT_PATH = writeSnapshotFixture();
 });
 
@@ -526,5 +530,135 @@ describe('the test tree and the run row (spec 013)', () => {
     expect(box.onSession).toBeUndefined();
     await env.teardown();
     expect(ends).toEqual([{ id: 's1', status: 'failed' }]);
+  });
+});
+
+describe('the interrupted-call report (spec 020)', () => {
+  const TIMEOUT = 'Exceeded timeout of 500 ms for a hook.\nAdd a timeout value to this test.';
+  const interrupted = (on: string, forMs: number) =>
+    new AbortError(Object.assign(new Error('cancelled'), { name: 'AbortReason', kind: 'test-failed' }), { outcome: 'undone', waiting: { on, forMs } });
+
+  /** A wire call the session's tracker reports, settled by hand. */
+  function trackedCall(method: string) {
+    let reject!: (error: unknown) => void;
+    let resolve!: () => void;
+    const call = new Promise<void>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    box.onCall?.(method, call);
+    return { call, resolve, reject };
+  }
+
+  const handle = (env: DetoxCircusEnvironment, name: string, extra: Record<string, unknown>, state: unknown = {}) =>
+    (env.handleTestEvent as (event: unknown, state: unknown) => void | Promise<void>)({ name, ...extra }, state);
+
+  it('a timed-out test: the unit aborts typed, and the interrupted call is appended to the string verdict jest itself produced', async () => {
+    const env = makeEnvironment();
+    await env.setup();
+    try {
+      const test = { name: 't', errors: [] as unknown[] };
+      dispatch(env, 'test_fn_start', { test });
+      const unitAmbient = box.ambient;
+      const launch = trackedCall('launchApp');
+      const asyncError = new Error('registration site');
+      const verdict = TIMEOUT.replace('hook', 'test');
+      test.errors.push([verdict, asyncError]);
+      const reported = handle(env, 'test_fn_failure', { test, error: verdict });
+      expect(unitAmbient?.aborted).toBe(true);
+      expect((unitAmbient?.reason as Record<string, unknown>).kind).toBe('test-failed');
+      expect(reported).toBeInstanceOf(Promise);
+      launch.reject(interrupted('awaiting-login', 512.4));
+      await reported;
+      expect(test.errors).toEqual([[`${verdict}\n\nInterrupted: launchApp — awaiting-login for 512ms`, asyncError]]);
+    } finally {
+      await env.teardown();
+    }
+  });
+
+  it('a timed-out beforeAll: every test under the describe gets the line, and the hook step ends only after the answer', async () => {
+    box.state = { session: { log: { begin: () => ({ id: 'h', end: () => ends.push('hook'), run: (fn: () => unknown) => fn() }) } } } as unknown as CompatState;
+    const ends: string[] = [];
+    const env = makeEnvironment();
+    await env.setup();
+    try {
+      const root = { name: 'ROOT_DESCRIBE_BLOCK' };
+      const hook = { type: 'beforeAll', parent: root };
+      const inner = { name: 'inner', errors: [] as unknown[] };
+      const outer = { name: 'outer', errors: [] as unknown[] };
+      const describeBlock = { children: [{ type: 'test', ...outer }, { type: 'describeBlock', children: [{ type: 'test', ...inner }] }, { type: 'hook' }] };
+      dispatch(env, 'hook_start', { hook });
+      const launch = trackedCall('launchApp');
+      // Circus pushes one tuple per test, before the environment hears the event.
+      const lists = errorListsUnder(describeBlock);
+      for (const list of lists) list.push([TIMEOUT, undefined]);
+      const reported = handle(env, 'hook_failure', { hook, describeBlock, error: TIMEOUT });
+      await Promise.resolve();
+      expect(ends).toEqual([]);
+      launch.reject(interrupted('spawning', 40));
+      await reported;
+      expect(ends).toEqual(['hook']);
+      for (const list of lists) expect(list).toEqual([[`${TIMEOUT}\n\nInterrupted: launchApp — spawning for 40ms`, undefined]]);
+    } finally {
+      await env.teardown();
+    }
+  });
+
+  it('an afterAll failure lands on the unhandled errors; a call with nothing to say adds nothing', async () => {
+    const env = makeEnvironment();
+    await env.setup();
+    try {
+      const hook = { type: 'afterAll', parent: { name: 'ROOT_DESCRIBE_BLOCK' } };
+      const state = { unhandledErrors: [[TIMEOUT, undefined]] as unknown[] };
+      dispatch(env, 'hook_start', { hook });
+      const launch = trackedCall('launchApp');
+      const plain = trackedCall('invoke');
+      const reported = handle(env, 'hook_failure', { hook, error: TIMEOUT }, state);
+      launch.reject(interrupted('awaiting-ready', 7));
+      plain.reject(new Error('unrelated'));
+      await reported;
+      expect(state.unhandledErrors).toEqual([[`${TIMEOUT}\n\nInterrupted: launchApp — awaiting-ready for 7ms`, undefined]]);
+    } finally {
+      await env.teardown();
+    }
+  });
+
+  it('no answer within the bound, no line: jest gets its own report, and the hook step still ends', async () => {
+    box.state = { session: { log: { begin: () => ({ id: 'h', end: () => ends.push('hook'), run: (fn: () => unknown) => fn() }) } } } as unknown as CompatState;
+    const ends: string[] = [];
+    const env = makeEnvironment();
+    await env.setup();
+    vi.useFakeTimers();
+    try {
+      const hook = { type: 'beforeEach', parent: { name: 'ROOT_DESCRIBE_BLOCK' } };
+      const test = { name: 't', errors: [[TIMEOUT, undefined]] as unknown[] };
+      dispatch(env, 'hook_start', { hook });
+      trackedCall('launchApp');
+      const reported = handle(env, 'hook_failure', { hook, test, error: TIMEOUT });
+      await vi.advanceTimersByTimeAsync(INTERRUPTED_ANSWER_BOUND_MS);
+      await reported;
+      expect(ends).toEqual(['hook']);
+      expect(test.errors).toEqual([[TIMEOUT, undefined]]);
+    } finally {
+      vi.useRealTimers();
+      await env.teardown();
+    }
+  });
+
+  it('a call that settled before the failure is forgotten; a call outside any unit is never tracked', async () => {
+    const env = makeEnvironment();
+    await env.setup();
+    try {
+      trackedCall('allocateDevice').resolve();
+      dispatch(env, 'test_fn_start');
+      const done = trackedCall('invoke');
+      const failed = trackedCall('invoke');
+      done.resolve();
+      failed.reject(new Error('own failure'));
+      await failed.call.catch(() => undefined);
+      expect(handle(env, 'test_fn_failure', { error: new Error('x') })).toBeUndefined();
+    } finally {
+      await env.teardown();
+    }
   });
 });

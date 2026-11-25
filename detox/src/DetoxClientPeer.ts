@@ -70,21 +70,34 @@ export interface DetoxClientPeerDeps {
    * no `step`.
    */
   stepOf?: () => string | undefined;
+  /**
+   * Told of every request as it goes out, with its wire method (spec 020):
+   * the jest environment waits on a failed unit's calls through it. The
+   * runner-integration door, like `ambient` (@internal).
+   */
+  onCall?: (method: string, call: Promise<unknown>) => void;
 }
 
 class DetoxClientPeerBase {
   protected _peer: Peer;
   private _stepOf: (() => string | undefined) | undefined;
+  private _onCall: DetoxClientPeerDeps['onCall'];
   constructor(deps: DetoxClientPeerDeps) {
     this._peer = deps.peer;
     this._stepOf = deps.stepOf;
+    this._onCall = deps.onCall;
   }
 
   /** A typed request method; an explicit `opts.step` beats the ambient one. */
   protected _method<P, R>(method: string): (params: P, opts?: CallOptions) => Promise<R> {
     return (params: P, opts?: CallOptions) => {
       const step = opts?.step ?? this._stepOf?.();
-      return this._peer.request<R>({ method, params, ...opts, ...(step !== undefined ? { step } : {}) });
+      const call = this._peer.request<R>({ method, params, ...opts, ...(step !== undefined ? { step } : {}) });
+      if (this._onCall === undefined) return call;
+      this._onCall(method, call);
+      // The observer attaches handlers to `call`; the caller gets a promise of its own, so an
+      // unawaited failure still surfaces as an unhandled rejection.
+      return call.then((value) => value);
     };
   }
 }

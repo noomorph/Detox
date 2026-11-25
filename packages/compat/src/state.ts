@@ -62,6 +62,13 @@ export interface CompatStateBox {
    * Undefined everywhere outside the runner integration.
    */
   ambient: AbortSignal | undefined;
+  /**
+   * Told of every wire request this surface's session sends, with its method
+   * (spec 020): the jest environment keeps a failed unit's in-flight calls
+   * so it can report what they were waiting for. Undefined outside the
+   * runner integration.
+   */
+  onCall: ((method: string, call: Promise<unknown>) => void) | undefined;
   /** Set by the jest environment before `connect` — an idle session must not hold a worker open. */
   unrefSocket: boolean;
   /**
@@ -72,6 +79,13 @@ export interface CompatStateBox {
    * run to `detox test`. Undefined everywhere outside the runner integration.
    */
   onSession: ((session: Detox) => void) | undefined;
+  /**
+   * The surface's own objects by name (spec 021): `device`, `element`, `by`,
+   * `expect`, `waitFor`. The first copy to load owns them; every later copy
+   * exports the same ones, so a wrapper a suite installs on the global
+   * `device` is there for a file that imports it.
+   */
+  surface: Record<string, unknown>;
 }
 
 export const COMPAT_STATE_KEY = Symbol.for('detox-compat.state.v21');
@@ -92,10 +106,18 @@ export function compatStateBox(): CompatStateBox {
       pendingInit: undefined,
       launchArgsEditor: new LaunchArgsEditor(),
       ambient: undefined,
+      onCall: undefined,
       unrefSocket: false,
       onSession: undefined,
+      surface: {},
     };
     carrier[COMPAT_STATE_KEY] = box;
   }
   return box;
+}
+
+/** This realm's one object under `name`: the first copy's, whichever copy asks. */
+export function sharedSurface<T>(name: string, own: T): T {
+  const { surface } = compatStateBox();
+  return (surface[name] ??= own) as T;
 }

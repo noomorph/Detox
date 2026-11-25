@@ -4,7 +4,7 @@ import type { DetoxServerPeer } from './DetoxServerPeer';
 import type { DriverHost } from './drivers';
 import type { DeviceLease } from './driver';
 import type { AppGateway, AppSession } from './AppGateway';
-import { AbortError, DetoxError, DetoxErrorCode } from '@detox-remote/core';
+import { AbortError, AbortReason, DetoxError, DetoxErrorCode } from '@detox-remote/core';
 import type {
   AllocateDeviceRequest,
   AllocateDeviceResponse,
@@ -134,6 +134,8 @@ interface RequestContext {
    * `progress`: an absent ledger would make "nobody took the device back" silent and type-checked-away.
    */
   onUndo: (fn: () => void | Promise<void>) => void;
+  /** States what the handler is waiting for — reported if the request is cancelled (spec 020). */
+  waiting?: (on: string, fields?: Record<string, unknown>) => void;
 }
 
 /** A pending `attach`, tracked on its allocation so a release rejects it `DETOX_STALE_HANDLE`. */
@@ -204,10 +206,21 @@ interface BiometricEventArgs {
 interface LaunchFailureArgs {
   err: unknown;
   bundleId: string;
-  callerSignal: AbortSignal | undefined;
-  /** Absent when the caller passed `readyTimeoutMs: 0` — no server clock exists. */
-  deadline: AbortSignal | undefined;
+  /** The caller's signal combined with the ready deadline; its reason says which ended the launch. */
+  signal: AbortSignal | undefined;
+  /** The server's ready deadline, not the caller, ended the launch. */
+  timedOut: boolean;
+  stage: LaunchStage;
 }
+
+/** What a launch is waiting for: the driver's spawn, the app's login, the app's `ready`. */
+type LaunchStage = 'spawning' | 'awaiting-login' | 'awaiting-ready';
+
+const LAUNCH_STAGE_VERDICT: Record<LaunchStage, string> = {
+  spawning: 'the launch command itself did not return in time',
+  'awaiting-login': 'the app never connected (is the Detox instrumentation injected?)',
+  'awaiting-ready': 'the app connected but never reported ready',
+};
 
 const notImplementedError = (method: string): DetoxError =>
   new DetoxError(`${method} is not implemented by this device's driver`, {
@@ -908,9 +921,7 @@ export class DetoxServerImpl {
     const deadline =
       params.readyTimeoutMs === 0
         ? undefined
-        : AbortSignal.timeout(
-            params.readyTimeoutMs ?? this._config.launchReadyTimeoutMs ?? LAUNCH_READY_TIMEOUT_MS,
-          );
+        : readyDeadline(params.readyTimeoutMs ?? this._config.launchReadyTimeoutMs ?? LAUNCH_READY_TIMEOUT_MS);
     const handshakeSignal = combineSignals(ctx.signal, deadline);
 
     // @issue DTX-6021: payloads materialize to the server's own files and are ledgered for rollback.
@@ -944,11 +955,39 @@ export class DetoxServerImpl {
     // the new one; at spawn time it is dead, or never existed. Before the
     // spawn, so whichever of "launch returned" and "the app dialed in" comes first, the login
     // has a home.
+    // The request's trace (the peer's handler scope; a bare unit harness has none): the app's
+    // handshake lines and its stdout/stderr (spec 013) are written under this request's node.
+    const trace = currentRequestTrace();
     let pending: ReturnType<AppGateway['expectLogin']> | undefined;
     const armClaim = (): void => {
       if (pending) return;
       gateway.supersede(sessionId, 'superseded by a relaunch');
-      pending = gateway.expectLogin(sessionId);
+      pending = gateway.expectLogin(sessionId, trace);
+      // The app may log in while the driver's launch is still returning: the login decides, not the code position.
+      void pending.session.then(() => enterStage('awaiting-ready'), () => undefined);
+      void pending.session.then((claimed) => claimed.ready).catch(reportGone);
+    };
+    // The app can log in and die while the driver's launch command has still not returned;
+    // nothing awaits its session yet, so its death is raced against that command.
+    let reportGone!: (reason: unknown) => void;
+    const appGone = new Promise<never>((_resolve, reject) => {
+      reportGone = reject;
+    });
+    appGone.catch(() => undefined);
+    let driverLaunch: ReturnType<typeof lease.launch> | undefined;
+    let launchReturned = false;
+    let stage: LaunchStage = 'spawning';
+    let stageSince = Date.now();
+    // `awaiting-ready` is reached by the login alone, so it says whether the launch command is still out.
+    const stateWait = (): void =>
+      ctx.waiting?.(stage, stage === 'awaiting-ready' && !launchReturned ? { launchReturned } : undefined);
+    stateWait();
+    const enterStage = (next: LaunchStage): void => {
+      // Frozen once the launch is cancelled: the answer and the log must name the same stage.
+      if (handshakeSignal?.aborted || stage === 'awaiting-ready' || stage === next) return;
+      stage = next;
+      stageSince = Date.now();
+      stateWait();
     };
     let pid: number | undefined;
     let session: AppSession | undefined;
@@ -980,14 +1019,11 @@ export class DetoxServerImpl {
       }
     });
 
-    // The app's own stdout/stderr (spec 013): captured under this request's node, when a
-    // request trace exists to write them to (the peer's handler scope; a bare unit harness has none).
-    const trace = currentRequestTrace();
     const output = trace
       ? { sink: trace, budgetBytes: this._config.appOutputBudgetBytes ?? DEFAULT_APP_OUTPUT_BUDGET_BYTES }
       : undefined;
     try {
-      const launched = await lease.launch({
+      driverLaunch = lease.launch({
         bundleId,
         sessionId,
         serverUrl: gateway.url,
@@ -998,17 +1034,34 @@ export class DetoxServerImpl {
         signal: handshakeSignal,
         onSpawn: armClaim,
       });
+      const launched = await Promise.race([driverLaunch, appGone]);
+      launchReturned = true;
+      if ((stage as LaunchStage) === 'awaiting-ready' && !handshakeSignal?.aborted) stateWait();
       // A driver whose launch never signalled a spawn (it spawns nothing — the fake): the claim
       // is armed now, and the app is expected to dial in on its own.
       armClaim();
       pid = launched.pid;
       stopOutput = launched.stopOutput;
+      enterStage('awaiting-login');
       session = await abortable(pending!.session, handshakeSignal);
       session.pid = pid;
       await abortable(session.ready, handshakeSignal);
     } catch (err) {
       stopOutput?.();
-      throw this._launchFailure({ err, bundleId, callerSignal: ctx.signal, deadline });
+      // An abandoned launch command may still return with the app's output capture running.
+      // Its own late failure has no one left to tell: `appGone` is handled above.
+      if (!launchReturned) void driverLaunch?.then((late) => late.stopOutput?.()).catch(reportGone);
+      // The server's own clock, by identity — a reason kind alone could be anyone's word.
+      const timedOut = deadline?.aborted === true && handshakeSignal?.reason === deadline.reason;
+      if (ctx.signal?.aborted && !timedOut) {
+        const waitedMs = Date.now() - stageSince;
+        trace?.line('warn', `[server] launchApp — cancelled while ${stage} after ${String(waitedMs)}ms: ${bundleId}`, {
+          stage,
+          waitedMs,
+          launchReturned,
+        });
+      }
+      throw this._launchFailure({ err, bundleId, signal: handshakeSignal, timedOut, stage });
     }
 
     // @issue DTX-6005: a cancellation landing during the handshake must not hand over an app
@@ -1127,18 +1180,18 @@ export class DetoxServerImpl {
   }
 
   /**
-   * Names the failure honestly: the caller's abort stays the uniform typed abort; the deadline
-   * expiring is the app's failure to complete the handshake — `DETOX_APP_DIED`.
+   * Names the failure honestly, from the abort's reason: the caller's abort stays the uniform
+   * typed abort; the deadline expiring is the app's failure to complete the handshake —
+   * `DETOX_APP_DIED`.
    */
-  private _launchFailure({ err, bundleId, callerSignal, deadline }: LaunchFailureArgs): Error {
-    if (callerSignal?.aborted) {
-      return new AbortError(callerSignal.reason);
+  private _launchFailure({ err, bundleId, signal, timedOut, stage }: LaunchFailureArgs): Error {
+    if (signal?.aborted && !timedOut) {
+      return new AbortError(signal.reason);
     }
-    if (deadline?.aborted && (err instanceof AbortError || !(err instanceof DetoxError))) {
+    if (timedOut && (err instanceof AbortError || !(err instanceof DetoxError))) {
       return new DetoxError(
-        `launchApp: ${bundleId} never completed the launch handshake — the app did not ` +
-          'connect and report ready in time (is the Detox instrumentation injected?)',
-        { code: DetoxErrorCode.DETOX_APP_DIED, details: { bundleId } },
+        `launchApp: ${bundleId} never completed the launch handshake — ${LAUNCH_STAGE_VERDICT[stage]}`,
+        { code: DetoxErrorCode.DETOX_APP_DIED, details: { bundleId, stage } },
       );
     }
     return err instanceof Error ? err : new Error(String(err));
@@ -1537,6 +1590,17 @@ function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Pro
     signal.addEventListener('abort', onAbort, { once: true });
     promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
   });
+}
+
+/** The launch handshake's clock: a signal aborted with a `ready-timeout` reason after `ms`. */
+function readyDeadline(ms: number): AbortSignal {
+  const controller = new AbortController();
+  AbortSignal.timeout(ms).addEventListener(
+    'abort',
+    () => controller.abort(new AbortReason('ready-timeout', `the launch handshake took longer than ${String(ms)}ms`)),
+    { once: true },
+  );
+  return controller.signal;
 }
 
 /** Composes two optional abort signals into one (or none). */

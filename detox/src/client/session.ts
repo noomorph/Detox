@@ -64,6 +64,8 @@ import { StepContext } from './step-context';
  */
 interface InternalInitOptions {
   ambient?: () => AbortSignal | undefined;
+  /** Told of every wire request as it goes out — see {@link DetoxClientPeerDeps.onCall}. */
+  onCall?: (method: string, call: Promise<unknown>) => void;
   unrefSocket?: boolean;
   announceTimeoutMs?: number;
 }
@@ -147,6 +149,7 @@ export async function connectSession(options: DetoxConnectOptions): Promise<Deto
     address,
     signal: options.signal,
     ambient: internal.ambient,
+    onCall: internal.onCall,
     allocationTimeout: options.allocationTimeout,
   });
   // The announce is the server's first frame; since spec 012 it
@@ -321,6 +324,8 @@ interface DetoxSessionInit {
   signal?: AbortSignal;
   /** The runner-integration ambient provider (@internal) — see {@link connectSession}. */
   ambient?: () => AbortSignal | undefined;
+  /** The runner-integration call tracker (@internal) — see {@link connectSession}. */
+  onCall?: (method: string, call: Promise<unknown>) => void;
   /** `allocateDevice`'s patience with a full pool (spec 018), already validated by `connectSession`; absent = none. */
   allocationTimeout?: number;
 }
@@ -352,9 +357,9 @@ class DetoxSession implements Detox {
     this.#rejectAnnounced = reject;
   });
 
-  constructor({ socket, channel, registry, address, signal, ambient, allocationTimeout }: DetoxSessionInit) {
+  constructor({ socket, channel, registry, address, signal, ambient, onCall, allocationTimeout }: DetoxSessionInit) {
     this.#channel = channel ?? createWebSocketChannel(socket);
-    this.#client = new DetoxClientPeer({ peer: Peer.create(this.#channel), stepOf: () => this.#steps.current() });
+    this.#client = new DetoxClientPeer({ peer: Peer.create(this.#channel), stepOf: () => this.#steps.current(), onCall });
     this.#registry = registry;
     this.#blobLane = new BlobLaneClient(address);
     this.#sessionSignal = signal;
