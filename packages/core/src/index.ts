@@ -9,8 +9,11 @@ export {
   DevicePoolExhaustedError,
   NoMatchingDeviceError,
   DeviceUnknownStateError,
+  AbortReason,
+  abortKindOf,
+  readAbortKind,
 } from './errors';
-export type { DetoxErrorOptions, AbortErrorDetails } from './errors';
+export type { DetoxErrorOptions, AbortErrorDetails, AbortKind, AbortWaiting } from './errors';
 
 export { errorFromWire, toWireError } from './errors';
 export type { WireError } from './errors';

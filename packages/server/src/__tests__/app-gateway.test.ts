@@ -20,6 +20,7 @@ import { DetoxErrorCode } from '@detox-remote/core';
 
 import { AppGateway, ignoreSocketError } from '../AppGateway';
 import { requestScope, type RequestTrace } from '../request-scope';
+import { serverLog } from '../log-sink';
 import { DetoxServerImpl } from '../DetoxServerImpl';
 import type { DetoxServerPeer } from '../DetoxServerPeer';
 import type { SimulatorOps, TerminateAppArgs } from '@detox-remote/driver-ios';
@@ -31,6 +32,7 @@ interface HandlerCtx {
   signal?: AbortSignal;
   progress?: (value: unknown) => void;
   onUndo?: (fn: UndoFn) => void;
+  waiting?: (on: string) => void;
 }
 
 type Handler<P, R> = (params: P, ctx: HandlerCtx) => Promise<R>;
@@ -245,7 +247,7 @@ interface RawSocketCarrier {
 
 interface ServerOptions {
   /** What the fake "process" does when simctl launch runs. */
-  onLaunch?: (gatewayUrl: string, bundleId: string) => void;
+  onLaunch?: (gatewayUrl: string, bundleId: string) => unknown;
   onTerminate?: (args: TerminateAppArgs) => unknown;
   /** Awaited before the fake simctl launch "spawns" — for barrier tests. */
   launchGate?: Promise<void>;
@@ -290,7 +292,7 @@ async function makeServer(options: ServerOptions = {}) {
       if (options.launchGate) await options.launchGate;
       // The per-device gateway URL the server hands the process — the fake app
       // dials it verbatim, exactly as the real app reads its own argv.
-      options.onLaunch?.(detox?.serverUrl ?? '', bundleId);
+      await options.onLaunch?.(detox?.serverUrl ?? '', bundleId);
       return 4242;
     },
   } as unknown as SimulatorOps;
@@ -393,7 +395,7 @@ describe('the launch handshake', () => {
     const allocation = await server.allocate({ type: 'ios.simulator' }, {});
     await expect(
       server.launchApp({ allocationId: allocation.allocationId, appId: 'com.example.app' }, {}),
-    ).rejects.toMatchObject({ code: DetoxErrorCode.DETOX_APP_DIED });
+    ).rejects.toMatchObject({ code: DetoxErrorCode.DETOX_APP_DIED, details: { stage: 'awaiting-ready' } });
   });
 
   it('dies typed when the process never connects at all', async () => {
@@ -401,7 +403,7 @@ describe('the launch handshake', () => {
     const allocation = await server.allocate({ type: 'ios.simulator' }, {});
     await expect(
       server.launchApp({ allocationId: allocation.allocationId, appId: 'com.example.app' }, {}),
-    ).rejects.toMatchObject({ code: DetoxErrorCode.DETOX_APP_DIED });
+    ).rejects.toMatchObject({ code: DetoxErrorCode.DETOX_APP_DIED, details: { stage: 'awaiting-login' } });
   });
 
   it('skips terminate-first on a clean server boot, then terminates on relaunch (the simctl-hang probe)', async () => {
@@ -507,6 +509,75 @@ describe('the launch handshake', () => {
     // skipped: clean server boot).
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(terminated).toEqual(['com.example.app']);
+  });
+
+  it('a cancelled launch leaves its stage and the time it waited under the request (spec 019)', async () => {
+    const server = await makeServer({ onLaunch: (url, bundleId) => dialApp(url, bundleId, { markReady: false }) });
+    const written: Array<{ level: string; fields?: Record<string, unknown> }> = [];
+    const trace: RequestTrace = {
+      beginSpawn: () => ({ end: () => undefined }),
+      line: (level, _msg, fields) => written.push({ level, fields }),
+    };
+    const allocation = await server.allocate({ type: 'ios.simulator' }, {});
+    const aborter = new AbortController();
+    const launching = requestScope.run(trace, () =>
+      server.launchApp({ allocationId: allocation.allocationId, appId: 'com.example.app' }, { signal: aborter.signal }),
+    );
+    await vi.waitFor(() => expect(written.some((l) => l.fields?.handshake === 'login')).toBe(true));
+    aborter.abort(new Error('changed my mind'));
+    await expect(launching).rejects.toMatchObject({ code: DetoxErrorCode.DETOX_ABORTED });
+    const stopped = written.find((l) => l.fields?.stage !== undefined);
+    expect(stopped).toMatchObject({ level: 'warn', fields: { stage: 'awaiting-ready', waitedMs: expect.any(Number) as number } });
+    // The session keeps its launch: its socket closing is told there too.
+    await vi.waitFor(() => expect(written.some((l) => l.fields?.code !== undefined && l.fields.sessionId !== undefined)).toBe(true));
+  });
+
+  it('an app that logs in and dies while the launch command has not returned fails the launch at once', async () => {
+    let app!: FakeApp;
+    let launchCommandReturns: () => void = () => undefined;
+    const stages: Array<[string, unknown]> = [];
+    const server = await makeServer({
+      // The launch command never returns: the app dialed in from inside it.
+      onLaunch: (url, bundleId) => {
+        app = dialApp(url, bundleId, { markReady: false });
+        return new Promise<void>((resolve) => {
+          launchCommandReturns = resolve;
+        });
+      },
+    });
+    const allocation = await server.allocate({ type: 'ios.simulator' }, {});
+    const launching = server.launchApp(
+      { allocationId: allocation.allocationId, appId: 'com.example.app' },
+      { waiting: (on: string, fields?: unknown) => stages.push([on, fields]) },
+    );
+    launching.catch(() => undefined);
+    await vi.waitFor(() => expect(stages.at(-1)).toEqual(['awaiting-ready', { launchReturned: false }]));
+    app.close();
+    await expect(launching).rejects.toMatchObject({ code: DetoxErrorCode.DETOX_APP_DIED });
+    // The abandoned command returning late is absorbed.
+    launchCommandReturns();
+    await new Promise((resolve) => setImmediate(resolve));
+  });
+
+  it('a launch states each stage it waits in through ctx.waiting (spec 020)', async () => {
+    const server = await makeServer({ onLaunch: (url, bundleId) => dialApp(url, bundleId) });
+    const allocation = await server.allocate({ type: 'ios.simulator' }, {});
+    const stages: string[] = [];
+    await server.launchApp(
+      { allocationId: allocation.allocationId, appId: 'com.example.app' },
+      { waiting: (on: string) => stages.push(on) },
+    );
+    expect(stages).toEqual(['spawning', 'awaiting-login', 'awaiting-ready']);
+  });
+
+  it('the ready deadline is told by its reason: a ready-timeout verdict, not a caller abort (spec 020)', async () => {
+    const server = await makeServer({ launchReadyTimeoutMs: 100 });
+    const allocation = await server.allocate({ type: 'ios.simulator' }, {});
+    const caller = new AbortController();
+    await expect(
+      server.launchApp({ allocationId: allocation.allocationId, appId: 'com.example.app' }, { signal: caller.signal }),
+    ).rejects.toMatchObject({ code: DetoxErrorCode.DETOX_APP_DIED, details: { stage: 'awaiting-login' } });
+    expect(caller.signal.aborted).toBe(false);
   });
 });
 
@@ -841,6 +912,43 @@ describe('the login discipline of the app port', () => {
    * The login is answered `loginSuccess` (echoing its id) and probed `isReady`;
    * the session becomes attachable on its own `ready`, and `connected()` lists it.
    */
+  it('a login nobody launched is told server-rank, naming the device; a socket that leaves before logging in is told under the one waiting launch (spec 019)', async () => {
+    const gateway = await AppGateway.listen({ deviceId: 'udid-1' });
+    gateways.push(gateway);
+    const serverRank: Array<Record<string, unknown> | undefined> = [];
+    serverLog.attachServerFile((_level, _message, fields) => serverRank.push(fields));
+    try {
+      dialApp(gateway.url, 'com.example.outside');
+      await gateway.waitForReady('com.example.outside');
+      // By field: an earlier test's socket may still be closing into the process-wide sink.
+      expect(serverRank.filter((fields) => fields?.handshake !== undefined)).toEqual([
+        { deviceId: 'udid-1', handshake: 'connected' },
+        { deviceId: 'udid-1', sessionId: 'com.example.outside', handshake: 'login' },
+        { deviceId: 'udid-1', sessionId: 'com.example.outside', handshake: 'ready' },
+      ]);
+
+      const claimed: Array<Record<string, unknown> | undefined> = [];
+      const pending = gateway.expectLogin('com.example.mute', {
+        beginSpawn: () => ({ end: () => undefined }),
+        line: (_level, _msg, fields) => claimed.push(fields),
+      });
+      const mute = dialApp(gateway.url, 'com.example.mute', { login: false });
+      await vi.waitFor(() => expect(claimed).toEqual([{ deviceId: 'udid-1', handshake: 'connected' }]));
+      mute.close();
+      await vi.waitFor(() => expect(claimed.at(-1)).toEqual({ deviceId: 'udid-1', code: expect.any(Number) as number }));
+      // A redial under the same claim adds nothing: one line each, however often the app comes back.
+      const again = dialApp(gateway.url, 'com.example.mute', { login: false });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      again.close();
+      await again.closed;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(claimed).toHaveLength(2);
+      pending.cancel();
+    } finally {
+      serverLog.attachServerFile(undefined);
+    }
+  });
+
   it('accepts an unsolicited login, probes it, and lists it once ready', async () => {
     const gateway = await AppGateway.listen({ deviceId: 'udid-1' });
     gateways.push(gateway);
@@ -1435,7 +1543,13 @@ describe('the app\'s own output (spec 013)', () => {
     expect(paths?.stdout.endsWith('.out')).toBe(true);
     expect(paths?.stderr.endsWith('.err')).toBe(true);
     await new Promise((resolve) => setTimeout(resolve, 150));
-    expect(written).toEqual([{ level: 'debug', msg: 'hello from the app', fields: { stream: 'stdout', pid: launched.pid, line: 1 } }]);
+    expect(written.filter((l) => l.fields?.stream !== undefined)).toEqual([{ level: 'debug', msg: 'hello from the app', fields: { stream: 'stdout', pid: launched.pid, line: 1 } }]);
+    // The app's handshake is told under the same request (spec 019).
+    expect(written.filter((l) => l.fields?.handshake !== undefined).map((l) => l.fields)).toEqual([
+      { deviceId: 'udid-1', handshake: 'connected' },
+      expect.objectContaining({ deviceId: 'udid-1', handshake: 'login' }),
+      expect.objectContaining({ deviceId: 'udid-1', handshake: 'ready' }),
+    ]);
 
     await server.terminateApp({ allocationId: allocation.allocationId, appHandleId: launched.appHandleId }, {});
     expect(existsSync(paths!.stdout)).toBe(false);

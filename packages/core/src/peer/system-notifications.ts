@@ -10,7 +10,8 @@ import type { CancelOutcome } from './undo-stack';
 
 export interface CancelRequestNotification extends RpcNotification {
   method: '$/cancelRequest';
-  params: { id: string };
+  /** `reason` is an `AbortKind` (spec 020), read through `readAbortKind`: absent or unknown means `caller`. */
+  params: { id: string; reason?: unknown };
 }
 
 /**

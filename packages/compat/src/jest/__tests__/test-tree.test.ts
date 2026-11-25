@@ -13,6 +13,7 @@ import {
   describeCircusError,
   fullNameOf,
   isRunnerOwnHook,
+  giveOwnAsyncError,
   wrapInStep,
   type CircusDescribeBlock,
   type CircusHook,
@@ -315,6 +316,43 @@ describe('hooks', () => {
       { id: 's1', status: 'failed' },
     ]);
     expect(beforeAll.fn).toBeTypeOf('function');
+  });
+
+  it('a failed hook\'s thrown string gets an asyncError of its own, whose header follows the message circus writes', () => {
+    const asyncError = new Error();
+    const hook: CircusHook = { type: 'beforeEach', parent: root, fn: (): void => undefined, asyncError };
+    // The read that fixes the shared header, before circus writes the thrown string into the message.
+    expect(isRunnerOwnHook(hook)).toBe(false);
+    const verdict = 'Exceeded timeout of 500 ms for a hook.';
+    const first: unknown[] = [[verdict, asyncError]];
+    const second: unknown[] = [['an earlier failure', asyncError], [verdict, asyncError]];
+    giveOwnAsyncError(verdict, [first, second]);
+
+    const own = (first[0] as [string, { message: string; stack: string }])[1];
+    const other = (second[1] as [string, { message: string; stack: string }])[1];
+    expect(own).not.toBe(asyncError);
+    expect(other).not.toBe(own);
+    expect((second[0] as unknown[])[1]).toBe(asyncError);
+    // Circus's own write, per failure: one test's text never reaches the other's.
+    own.message = 'thrown: "first"';
+    other.message = 'thrown: 42';
+    expect(own.stack).toMatch(/^Error: thrown: "first"\n\s+at /);
+    expect(other.stack).toMatch(/^Error: thrown: 42\n\s+at /);
+
+    // A throw that is not a string is covered the same way.
+    const number: unknown[] = [[42, { stack: 'Error' }]];
+    giveOwnAsyncError(42, [number]);
+    const frameless = (number[0] as [number, { message: string; stack: string }])[1];
+    frameless.message = 'thrown: 42';
+    expect(frameless.stack).toBe('Error: thrown: 42');
+
+    // Left alone: an error circus prints as it is, a tuple with no stack to keep, a list without the failure.
+    const real = new TypeError('no device');
+    const untouched: unknown[] = [[real, asyncError], ['late', {}], ['late'], 'not a tuple'];
+    giveOwnAsyncError(real, [untouched]);
+    giveOwnAsyncError('late', [untouched]);
+    giveOwnAsyncError('absent', [untouched]);
+    expect(untouched).toEqual([[real, asyncError], ['late', {}], ['late'], 'not a tuple']);
   });
 
   it('jest\'s own mock-reset beforeEach — registered from jest-circus\'s build — is no step; a tester\'s hook is', () => {

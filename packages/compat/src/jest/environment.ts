@@ -1,9 +1,10 @@
 /**
  * `DetoxCircusEnvironment` for Jest 30 (spec 010) — the lightweight port of
  * v20's `runners/jest/testEnvironment/index.js`, reduced on purpose: no IPC,
- * no facade, no listener framework, and no timer of any kind (jest's own
- * `testTimeout` is the only test clock; the environment only reacts to
- * circus saying a unit failed).
+ * no facade, no listener framework, and no test clock of its own (jest's
+ * own `testTimeout` is the only one; the environment only reacts to circus
+ * saying a unit failed — its one timer bounds how long a failed unit waits
+ * for its cancelled calls to answer).
  *
  * What it does, whole list:
  *  - first file in a worker: read the `detox test` snapshot, map it (spec
@@ -22,6 +23,9 @@
  *    on failure so the next unit finds the session clean; a
  *    passing unit aborts nothing; environment teardown aborts the file scope
  *    unconditionally;
+ *  - the interrupted-call report (spec 020): a failed unit's cancelled calls
+ *    say what they were waiting for, one line each on jest's failure —
+ *    see `interrupted.ts`;
  *  - the test tree in the run's log (spec 013, widening spec 010): the file,
  *    every describe, test and hook as steps with explicit parents, each body
  *    run inside its own step — see `test-tree.ts`; and the run named to
@@ -48,13 +52,14 @@ import type JestNodeEnvironment from 'jest-environment-node';
 import * as compat from '../index';
 import { COMPAT_STATE_KEY, compatStateBox } from '../state';
 import { emitFateWarnings } from './fates';
+import { appendToFailure, collectInterrupted, errorListsUnder, type TrackedCall } from './interrupted';
 import { detoxMatchers } from './matchers';
 import { applyPlatformFilter } from './platform-filter';
 import { requireFromProject } from './project-modules';
 import { appendRunRow, viewerUrlFor } from './run-rows';
 import { loadSnapshot, type LoadedSnapshot } from './snapshot';
 import { stampDetoxCodeName } from './taxonomy';
-import { CircusStepTree, type CircusDescribeBlock, type CircusHook, type CircusTestEntry } from './test-tree';
+import { CircusStepTree, giveOwnAsyncError, type CircusDescribeBlock, type CircusHook, type CircusTestEntry } from './test-tree';
 
 type NodeEnvironmentCtor = typeof JestNodeEnvironment;
 
@@ -73,9 +78,15 @@ const NodeEnvironment: NodeEnvironmentCtor =
   (nodeEnvironmentModule as NodeEnvironmentModule).TestEnvironment ??
   (nodeEnvironmentModule as NodeEnvironmentCtor);
 
-/** What a unit-scope abort tells the strays it settles. */
-const unitAbortReason = (what: string): Error =>
-  new Error(`detox: ${what} — its in-flight Detox calls were cancelled so the next test starts clean`);
+/** What a unit-scope abort tells the strays it settles — typed, so the server learns why (spec 020). */
+const unitAbortReason = (kind: UnitAbortReason['kind'], what: string): UnitAbortReason =>
+  Object.assign(new Error(`detox: ${what} — its in-flight Detox calls were cancelled so the next test starts clean`), {
+    name: 'AbortReason' as const,
+    kind,
+  });
+
+/** The typed abort reason the client reads by name and kind; the class itself is not public. */
+type UnitAbortReason = Error & { name: 'AbortReason'; kind: 'test-failed' | 'hook-failed' | 'file-ended' };
 
 /**
  * jest-environment-node's globals cleanup soft-deletes the own properties of
@@ -125,6 +136,8 @@ export class DetoxCircusEnvironment extends NodeEnvironment {
    * anyway.
    */
   #unitScopes = new WeakMap<object, AbortController>();
+  /** The wire calls each unit scope has in flight (spec 020), by the scope current when each was sent. */
+  #unitCalls = new WeakMap<AbortController, Set<TrackedCall>>();
   /** Captured once — collection-time events must never reach for session state. */
   readonly #platform = compat.device.getPlatform();
 
@@ -165,6 +178,7 @@ export class DetoxCircusEnvironment extends NodeEnvironment {
 
     this.#fileScope = new AbortController();
     box.ambient = this.#fileScope.signal;
+    box.onCall = (method, call) => this.#track(method, call);
     // An idle session must never hold a jest worker (or an in-band main
     // process) open — set before init so the socket unrefs at connect.
     box.unrefSocket = true;
@@ -199,6 +213,10 @@ export class DetoxCircusEnvironment extends NodeEnvironment {
       this.#openFile(box.state.session);
     }
 
+    // The surface's objects outlive a file whether or not they are globals: a later file's
+    // `require('detox')` is handed the same ones.
+    for (const value of [box.surface, ...Object.values(box.surface)]) protectFromJestCleanup(value);
+
     if (this.#loaded.behavior.exposeGlobals) {
       const g = this.global as unknown as Record<string, unknown>;
       g.device = compat.device;
@@ -206,9 +224,7 @@ export class DetoxCircusEnvironment extends NodeEnvironment {
       g.by = compat.by;
       g.waitFor = compat.waitFor;
       g.detox = compat;
-      for (const value of [compat.device, compat.element, compat.by, compat.waitFor, compat]) {
-        protectFromJestCleanup(value);
-      }
+      protectFromJestCleanup(compat);
       // `expect` is never shadowed — jest's own is extended on the circus `setup` event below.
     }
   }
@@ -220,9 +236,10 @@ export class DetoxCircusEnvironment extends NodeEnvironment {
     // Whatever this file left in flight dies with the file, unconditionally, before the next
     // file's setup adopts the session.
     this.#currentUnit = undefined;
-    this.#fileScope?.abort(unitAbortReason('the test file ended'));
+    this.#fileScope?.abort(unitAbortReason('file-ended', 'the test file ended'));
     const box = compatStateBox();
     box.ambient = undefined;
+    box.onCall = undefined;
     await super.teardown();
   }
 
@@ -252,7 +269,11 @@ export class DetoxCircusEnvironment extends NodeEnvironment {
     return this.#tree.stepOf(circusObject);
   }
 
-  handleTestEvent(event: Circus.Event, state: Circus.State): void {
+  /**
+   * Returns a promise only for a failed unit that has calls in flight: jest
+   * awaits it, so the report lands before jest prints the failure (spec 020).
+   */
+  handleTestEvent(event: Circus.Event, state: Circus.State): void | Promise<void> {
     const unit = event as UnitCircusEvent;
     switch (event.name) {
       case 'setup': {
@@ -307,13 +328,10 @@ export class DetoxCircusEnvironment extends NodeEnvironment {
         // A typed DetoxError thrown inside the test reaches jest's report with
         // its code name in the message.
         stampDetoxCodeName(unit.error);
-        this.#failUnit(unitAbortReason('a test failed (or timed out)'), unit.test);
-        break;
+        return this.#failUnit(unitAbortReason('test-failed', 'a test failed (or timed out)'), unit, state);
       case 'hook_failure':
         stampDetoxCodeName(unit.error);
-        if (unit.hook !== undefined) this.#tree.hookFailure(unit.hook, unit.error);
-        this.#failUnit(unitAbortReason('a hook failed (or timed out)'), unit.hook);
-        break;
+        return this.#failUnit(unitAbortReason('hook-failed', 'a hook failed (or timed out)'), unit, state);
       case 'test_done':
         if (unit.test !== undefined) this.#tree.testDone(unit.test);
         this.#endUnit(unit.test);
@@ -342,10 +360,50 @@ export class DetoxCircusEnvironment extends NodeEnvironment {
     compatStateBox().ambient = AbortSignal.any([this.#fileScope.signal, controller.signal]);
   }
 
-  /** @issue DTX-4056: the unit failed — its scope aborts (keyed, so a concurrent sibling's is never hit). */
-  #failUnit(reason: Error, key?: object): void {
+  /** Remembers a wire call under the current unit until it settles. */
+  #track(method: string, call: Promise<unknown>): void {
+    const unit = this.#currentUnit;
+    if (unit === undefined) return;
+    let calls = this.#unitCalls.get(unit);
+    if (calls === undefined) this.#unitCalls.set(unit, (calls = new Set()));
+    const entry: TrackedCall = { method, call };
+    calls.add(entry);
+    const forget = (): void => {
+      calls.delete(entry);
+    };
+    call.then(forget, forget);
+  }
+
+  /**
+   * @issue DTX-4056: the unit failed — its scope aborts (keyed, so a concurrent sibling's is never hit).
+   * Spec 020: its cancelled calls then get a bounded moment to answer, one line per
+   * interrupted call is appended to the failure jest prints, and only then does a failed
+   * hook's step end — a cancelled call ends before its parent step.
+   */
+  #failUnit(reason: UnitAbortReason, unit: UnitCircusEvent, state: Circus.State): void | Promise<void> {
+    const key = unit.hook ?? unit.test;
     const scoped = key !== undefined ? this.#unitScopes.get(key) : undefined;
-    (scoped ?? this.#currentUnit)?.abort(reason);
+    const controller = scoped ?? this.#currentUnit;
+    const inFlight = [...((controller && this.#unitCalls.get(controller)) ?? [])];
+    controller?.abort(reason);
+    const finish = (lines: readonly string[]): void => {
+      try {
+        const lists = this.#failureLists(unit, state);
+        if (unit.hook !== undefined) giveOwnAsyncError(unit.error, lists);
+        if (lines.length > 0) appendToFailure(unit.error, lists, lines.join('\n'));
+      } finally {
+        if (unit.hook !== undefined) this.#tree.hookFailure(unit.hook, unit.error);
+      }
+    };
+    if (inFlight.length === 0) return finish([]);
+    return collectInterrupted(inFlight).then(finish);
+  }
+
+  /** Where circus stored this failure's `[error, asyncError]` tuples. */
+  #failureLists(unit: UnitCircusEvent, state: Circus.State): unknown[][] {
+    if (unit.hook?.type === 'beforeAll') return errorListsUnder(unit.describeBlock);
+    if (unit.hook?.type === 'afterAll') return [state.unhandledErrors as unknown[]];
+    return unit.test?.errors !== undefined ? [unit.test.errors] : [];
   }
 
   /**

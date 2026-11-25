@@ -87,6 +87,43 @@ export function isRunnerOwnHook(hook: CircusHook): boolean {
   return firstFrame !== undefined && CIRCUS_OWN_FRAME.test(firstFrame);
 }
 
+/**
+ * Gives a failed hook's non-error throw an `asyncError` of its own, in every
+ * list circus stored the failure in. Circus reports such a throw (its own
+ * timeout verdict is a string) by writing it into `asyncError.message` and
+ * printing `asyncError.stack` — but V8 fixes a stack's header on first read,
+ * and {@link isRunnerOwnHook} has read it by then, so jest would print the
+ * frames with no message at all. And a hook's `asyncError` is one object for
+ * every run of the hook: a `beforeEach` failing in two tests would print the
+ * later failure twice. The stand-in's header follows whatever message circus
+ * writes; the registration frames are kept.
+ */
+export function giveOwnAsyncError(error: unknown, lists: readonly unknown[][]): void {
+  // An error circus prints as it is: one with a stack or a message.
+  const printable = error as { stack?: unknown; message?: unknown } | null | undefined;
+  if (printable && (typeof printable.stack === 'string' || printable.message)) return;
+  for (const list of lists) {
+    for (let at = list.length - 1; at >= 0; at -= 1) {
+      const entry = list[at];
+      if (!Array.isArray(entry) || entry[0] !== error) continue;
+      const registered = entry[1] as StackCarrier | null | undefined;
+      const stack = typeof registered === 'object' && registered !== null ? registered.stack : undefined;
+      if (typeof stack === 'string') {
+        const framesAt = stack.search(/\n\s+at /);
+        const frames = framesAt === -1 ? '' : stack.slice(framesAt);
+        const own = {
+          message: '',
+          get stack(): string {
+            return `Error: ${this.message}${frames}`;
+          },
+        };
+        list[at] = [entry[0], own, ...(entry.slice(2) as unknown[])];
+      }
+      break;
+    }
+  }
+}
+
 /** The door a step is begun through — `Detox['log']['begin']`, bound. */
 export type StepSink = (options: DetoxLogBeginOptions) => DetoxLogHandle;
 

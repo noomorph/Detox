@@ -20,13 +20,16 @@ import type { ConnectionLog, LogLineInput, LogNode } from './ConnectionLog';
 import { redactValue } from './redact';
 import { cutChildOutput } from './child-output';
 import { serverLog, type LogLevel, type ServerLogSink } from './log-sink';
-import { requestScope, type RequestTrace, type SpawnBegin, type SpawnSpan } from './request-scope';
+import { requestScope, serverRankTrace, type RequestTrace, type SpawnBegin, type SpawnSpan } from './request-scope';
 
 /** Params past this are stored as a string prefix with `paramsTruncated: true`. */
 export const PARAMS_CAP_BYTES = 16 * 1024;
 
 /** `--child-output-budget`: bytes of a child's captured output stored per stream (spec 013). */
 export const DEFAULT_CHILD_OUTPUT_BUDGET_BYTES = 64 * 1024;
+
+/** JSON-RPC's cancellation answer (LSP's `-32800`). */
+const JSONRPC_CANCELLED = -32800;
 
 /** The door the server's handlers narrate through: a line under the request the signal belongs to, else under `conn`. */
 export interface ConnectionTrace {
@@ -239,6 +242,10 @@ export class ConnectionRecorder implements PeerObserver, ConnectionTrace {
       // allocation or a launch produced without scraping narration.
       const summary = ok && !torn ? summarizeResult(method, result) : undefined;
       if (summary) fields.result = summary;
+      // Spec 020: a cancellation's `-32800` says why (`reason`) and what the call was waiting for.
+      const cancelled = error?.code === JSONRPC_CANCELLED ? (error.data as { reason?: unknown; waiting?: unknown } | undefined) : undefined;
+      if (typeof cancelled?.reason === 'string') fields.reason = cancelled.reason;
+      if (cancelled?.waiting !== undefined) fields.waiting = cancelled.waiting;
       if (torn) fields.reason = 'connection-closed';
       this.#end(nodeId, { ok: fields.ok === true, fields, level: torn ? 'warn' : ok ? 'info' : levelOfError(error) });
     } else {
@@ -341,7 +348,9 @@ export class ConnectionRecorder implements PeerObserver, ConnectionTrace {
   #traceFor(requestId: string): RequestTrace {
     return {
       beginSpawn: (info) => this.#beginSpawn(requestId, info),
-      line: (level, msg, fields) => this.#log_(requestId, { level, msg, ...(fields !== undefined ? { fields } : {}) }),
+      // A session can outlive the connection that launched it; its lines then go server-rank.
+      line: (level, msg, fields) =>
+        this.#log.closed ? serverRankTrace.line(level, msg, fields) : this.#log_(requestId, { level, msg, ...(fields !== undefined ? { fields } : {}) }),
     };
   }
 
@@ -527,7 +536,7 @@ function isProgressFrame(value: unknown): value is ProgressFrame {
 /** `warn` for a typed refusal (a registry code, or the cancellation answer), `error` otherwise. */
 function levelOfError(error: WireError | undefined): LogLevel {
   if (!error) return 'error';
-  const typed = (error.code >= 2000 && error.code <= 2099) || error.code === -32800;
+  const typed = (error.code >= 2000 && error.code <= 2099) || error.code === JSONRPC_CANCELLED;
   return typed ? 'warn' : 'error';
 }
 

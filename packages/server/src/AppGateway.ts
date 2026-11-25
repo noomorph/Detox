@@ -38,7 +38,8 @@ import type { IncomingMessage } from 'node:http';
 import { WebSocketServer, type WebSocket, type RawData } from 'ws';
 import { AbortError, DetoxError, DetoxErrorCode } from '@detox-remote/core';
 import type { InvokeResult } from '@detox-remote/protocol';
-import { describeError, serverLog } from './log-sink';
+import { describeError, type LogLevel } from './log-sink';
+import { serverRankTrace, type RequestTrace } from './request-scope';
 
 /** One frame of the frozen native dialect. */
 interface FrozenFrame {
@@ -133,6 +134,8 @@ export interface AppSessionInit {
   deviceId: string;
   sessionId: string;
   bundleId: string;
+  /** The trace of the launch that claimed this login; absent for a session nobody launched. */
+  trace?: RequestTrace;
 }
 
 /**
@@ -161,6 +164,7 @@ export class AppSession {
   readonly ready: Promise<void>;
 
   private readonly _socket: WebSocket;
+  private readonly _trace: RequestTrace;
   private _readyResolve!: () => void;
   private _readyReject!: (error: Error) => void;
   private _readySettled = false;
@@ -212,8 +216,9 @@ export class AppSession {
   /** Whether any crash report has arrived — the first-wins guard's own fact. */
   private _sawTerminationReport = false;
 
-  constructor(socket: WebSocket, { deviceId, sessionId, bundleId }: AppSessionInit) {
+  constructor(socket: WebSocket, { deviceId, sessionId, bundleId, trace }: AppSessionInit) {
     this._socket = socket;
+    this._trace = trace ?? serverRankTrace;
     this.deviceId = deviceId;
     this.sessionId = sessionId;
     this.bundleId = bundleId;
@@ -231,6 +236,11 @@ export class AppSession {
     // A launch abandoned before `ready` (abort, deadline) leaves this promise
     // to reject with nobody awaiting — that must not crash the server.
     this.ready.catch(() => undefined);
+  }
+
+  /** @internal — a line about this session: under the launch that claimed it, else server-rank. */
+  _say(level: LogLevel, message: string, fields?: Record<string, unknown>): void {
+    this._trace.line(level, message, { deviceId: this.deviceId, sessionId: this.sessionId, ...fields });
   }
 
   /** Dead sessions answer every action with `DETOX_APP_DIED` — permanently. */
@@ -411,7 +421,7 @@ export class AppSession {
     switch (frame.type) {
       case 'ready':
         if (!this._readySettled) {
-          serverLog.info(`[gateway] app said ready under "${this.sessionId}"`);
+          this._say('info', `[gateway] app said ready under "${this.sessionId}"`, { handshake: 'ready' });
           this._readyResolve();
         }
         // Settles the oldest reload entry — live waiter resolved, tombstone swallowed; an empty queue means a spontaneous ready.
@@ -450,7 +460,8 @@ export class AppSession {
         if (!waiter || waiter.doneType !== frame.type) {
           if (!this._loggedDroppedDones.has(frame.type)) {
             this._loggedDroppedDones.add(frame.type);
-            serverLog.info(
+            this._say(
+              'info',
               `[gateway] dropping unsolicited "${frame.type}" (messageId ${String(frame.messageId)}) from ${this.sessionId} — logged once per type`,
             );
           }
@@ -534,11 +545,14 @@ function runDeathHook(hook: () => void): void {
   try {
     hook();
   } catch (err) {
-    serverLog.error(`[gateway] a session death cleanup threw; ignoring it: ${describeError(err)}`);
+    serverRankTrace.line('error', `[gateway] a session death cleanup threw; ignoring it: ${describeError(err)}`);
   }
 }
 
 interface LoginExpectation {
+  trace?: RequestTrace;
+  /** Which pre-login socket lines this claim already carries — one each, however often the app redials. */
+  told?: Set<string>;
   resolve: (session: AppSession) => void;
   reject: (error: Error) => void;
   settled: boolean;
@@ -641,16 +655,17 @@ export class AppGateway {
    * Registers a launch's claim on the NEXT login under `sessionId`.
    * Registered before the spawn, so the app can never connect into a void —
    * whichever of "launch returned" and "app dialed in" happens first, the
-   * claim is already waiting.
+   * claim is already waiting. `trace` is the launch's own: the session that
+   * answers the claim writes its lines there.
    */
-  expectLogin(sessionId: string): PendingApp {
+  expectLogin(sessionId: string, trace?: RequestTrace): PendingApp {
     let resolve!: (session: AppSession) => void;
     let reject!: (error: Error) => void;
     const promise = new Promise<AppSession>((res, rej) => {
       resolve = res;
       reject = rej;
     });
-    const expectation: LoginExpectation = { resolve, reject, settled: false };
+    const expectation: LoginExpectation = { trace, resolve, reject, settled: false };
     const set = this._expected.get(sessionId) ?? new Set<LoginExpectation>();
     set.add(expectation);
     this._expected.set(sessionId, set);
@@ -761,6 +776,18 @@ export class AppGateway {
 
   private _accept(socket: WebSocket, _request: IncomingMessage): void {
     let session: AppSession | undefined;
+    // A socket that has not logged in names no session. While exactly one launch waits on this
+    // device, it is told under that launch — for as long as the launch still waits; otherwise server-rank,
+    // quietly. Once per claim (once per listener, server-rank): a refused app redials every second.
+    const claim = this._soleClaim();
+    const sayUnnamed = (key: string, message: string, fields: Record<string, unknown>): void => {
+      const trace = claim?.settled === false ? claim.trace : undefined;
+      const told = claim && trace ? (claim.told ??= new Set<string>()) : this._loggedRefusals;
+      if (told.has(`unnamed:${key}`)) return;
+      told.add(`unnamed:${key}`);
+      (trace ?? serverRankTrace).line(trace ? 'info' : 'debug', message, { deviceId: this._deviceId, ...fields });
+    };
+    sayUnnamed('connected', '[gateway] an app socket connected', { handshake: 'connected' });
 
     // Anything real logs in from its socket-open callback; an unreaped
     // silent socket is a standing grip on this server's shutdown.
@@ -777,7 +804,7 @@ export class AppGateway {
         // A peer that cannot speak the dialect is not an app; hang up. An
         // existing session dies through this same close path, like any
         // other loss.
-        serverLog.error(`[gateway] dropping connection on malformed frame: ${describeError(err)}`);
+        this._say('error', `[gateway] dropping connection on malformed frame: ${describeError(err)}`);
         socket.close(1008);
         return;
       }
@@ -790,9 +817,11 @@ export class AppGateway {
       else socket.close(1008);
     });
 
-    socket.on('close', () => {
+    socket.on('close', (code: number) => {
       clearTimeout(loginDeadline);
+      if (!session) sayUnnamed('closed', '[gateway] a socket closed before logging in', { code });
       if (session) {
+        session._say('info', `[gateway] app socket closed under "${session.sessionId}"`, { code });
         session._die('socket closed');
         this._sessions.delete(session);
         // A crash frees the id the moment the socket closes — unless a newer
@@ -804,12 +833,23 @@ export class AppGateway {
   }
 
   /** Logs a refusal once per distinct reason — never once per redial. */
-  private _refuse(key: string, message: string): undefined {
+  private _refuse(key: string, message: string, sessionId?: string): undefined {
     if (!this._loggedRefusals.has(key)) {
       this._loggedRefusals.add(key);
-      serverLog.error(message);
+      this._say('error', message, sessionId === undefined ? undefined : { sessionId });
     }
     return undefined;
+  }
+
+  /** The one launch waiting for a login on this device — `undefined` when none waits, or several do. */
+  private _soleClaim(): LoginExpectation | undefined {
+    const waiting = [...this._expected.values()].flatMap((set) => [...set]).filter((expectation) => !expectation.settled);
+    return waiting.length === 1 ? waiting[0] : undefined;
+  }
+
+  /** A server-rank line about this listener — no session to hang it under. */
+  private _say(level: LogLevel, message: string, fields?: Record<string, unknown>): void {
+    serverRankTrace.line(level, message, { deviceId: this._deviceId, ...fields });
   }
 
   /**
@@ -846,12 +886,15 @@ export class AppGateway {
       return this._refuse(
         `dup:${sessionId}`,
         `[gateway] a session is already live under "${sessionId}" — turning away the duplicate login`,
+        sessionId,
       );
     }
+    const expectations = this._expected.get(sessionId);
     const session = new AppSession(socket, {
       deviceId: this._deviceId,
       sessionId,
       bundleId: this._decodeBundleId(sessionId),
+      trace: [...(expectations ?? [])].find((expectation) => !expectation.settled)?.trace,
     });
     this._sessions.add(session);
     this._live.set(sessionId, session);
@@ -862,14 +905,15 @@ export class AppGateway {
     // dialed before the listener existed: its `ready` went out on the socket
     // task that failed, and the redial (`DetoxManager.swift:228-232`)
     // carries none of its own.
-    serverLog.info(
+    session._say(
+      'info',
       `[gateway] login accepted for "${sessionId}" — answering loginSuccess and probing isReady`,
+      { handshake: 'login' },
     );
     socket.send(JSON.stringify({ type: 'loginSuccess', messageId: frame.messageId, params: {} }));
     socket.send(
       JSON.stringify({ type: 'isReady', messageId: READY_SENTINEL_MESSAGE_ID, params: {} }),
     );
-    const expectations = this._expected.get(sessionId);
     if (expectations) {
       this._expected.delete(sessionId);
       for (const expectation of expectations) {
@@ -897,7 +941,7 @@ export class AppGateway {
       try {
         hook(session);
       } catch (err) {
-        serverLog.error(`[gateway] a login hook threw; ignoring it: ${describeError(err)}`);
+        session._say('error', `[gateway] a login hook threw; ignoring it: ${describeError(err)}`);
       }
     }
     return session;

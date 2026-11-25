@@ -176,6 +176,67 @@ export interface AbortErrorDetails {
    * swallowed, so a `switch` over this field needs a default arm.
    */
   readonly outcome?: CancelOutcome;
+  /**
+   * What the cancelled handler said it was waiting for (`ctx.waiting`), and
+   * for how long, at the moment the cancellation reached it. Rides the
+   * `-32800` answer only; absent when the handler stated nothing.
+   */
+  readonly waiting?: AbortWaiting;
+}
+
+/** A cancelled handler's last stated wait: `on` names it, `forMs` is how long it had lasted. */
+export interface AbortWaiting {
+  readonly on: string;
+  readonly forMs: number;
+  readonly [field: string]: unknown;
+}
+
+/**
+ * Why Detox itself cancelled something — a closed vocabulary, so a log and
+ * the wire can say it by field rather than by prose:
+ * - `test-failed` / `hook-failed` — jest failed that unit (a timeout included);
+ * - `file-ended` — the test file's scope closed under it;
+ * - `ready-timeout` — the server's launch-handshake deadline expired;
+ * - `connection-closed` — the caller's connection went away;
+ * - `caller` — any other signal: the caller's own.
+ */
+export type AbortKind = 'test-failed' | 'hook-failed' | 'file-ended' | 'ready-timeout' | 'connection-closed' | 'caller';
+
+const ABORT_KINDS: ReadonlySet<string> = new Set<AbortKind>([
+  'test-failed',
+  'hook-failed',
+  'file-ended',
+  'ready-timeout',
+  'connection-closed',
+  'caller',
+]);
+
+/** A kind from the vocabulary, or `undefined` for anything else (wire input is untrusted). */
+export function readAbortKind(value: unknown): AbortKind | undefined {
+  return typeof value === 'string' && ABORT_KINDS.has(value) ? (value as AbortKind) : undefined;
+}
+
+/**
+ * The reason Detox's own abort sites pass to `AbortController.abort`. An
+ * `Error`, so it still reads as a `cause`; recognised by `name` and `kind`
+ * rather than `instanceof`, because core is bundled into more than one entry.
+ */
+export class AbortReason extends Error {
+  readonly kind: AbortKind;
+
+  constructor(kind: AbortKind, message: string = `aborted: ${kind}`) {
+    super(message);
+    this.name = 'AbortReason';
+    this.kind = kind;
+  }
+}
+
+/** The kind of any `signal.reason`: ours by brand, a lost connection by code, else `caller`. */
+export function abortKindOf(reason: unknown): AbortKind {
+  const carrier = reason as { name?: unknown; kind?: unknown; code?: unknown } | null | undefined;
+  if (carrier?.name === 'AbortReason') return readAbortKind(carrier.kind) ?? 'caller';
+  if (carrier?.code === DetoxErrorCode.DETOX_CONNECTION_LOST) return 'connection-closed';
+  return 'caller';
 }
 
 /**
@@ -209,6 +270,7 @@ export class AbortError extends DetoxError {
     const own: Record<string, unknown> = {};
     if (details?.displaced !== undefined) own.displaced = details.displaced;
     if (details?.outcome !== undefined) own.outcome = details.outcome;
+    if (details?.waiting !== undefined) own.waiting = details.waiting;
     super('Aborted', {
       code: DetoxErrorCode.DETOX_ABORTED,
       cause: reason,

@@ -15,6 +15,12 @@ export interface RequestContext<TProgress = unknown> {
    * behind is expected to register it here, but nothing enforces that.
    */
   onUndo(fn: UndoFn): void;
+  /**
+   * States what the handler is waiting for right now; the last statement
+   * stands. If the request is cancelled, its `-32800` answer reports it as
+   * `waiting: { on, forMs, ...fields }`. Optional to call.
+   */
+  waiting(on: string, fields?: Record<string, unknown>): void;
 }
 
 export interface CallOptions<TProgress = unknown> {

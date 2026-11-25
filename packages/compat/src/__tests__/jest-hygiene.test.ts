@@ -160,6 +160,32 @@ describe('unit failure cancels the stray call through the real machinery', () =>
     }
   });
 
+  it('a failed test reports what its cancelled call was waiting for, on the error jest prints (spec 020)', async () => {
+    const server = await initCompat();
+    const env = makeEnvironment();
+    await env.setup();
+    try {
+      server.onRequest('sendToHome', (_params, ctx) => {
+        const { signal, waiting } = ctx as CtxWithSignal & { waiting: (on: string) => void };
+        waiting('backgrounding');
+        return new Promise((_never, reject) => signal.addEventListener('abort', () => reject(new Error('stopped'))));
+      });
+      const test = { errors: [] as unknown[] };
+      (env.handleTestEvent as (event: unknown, state: unknown) => void)({ name: 'test_fn_start', test }, {});
+      const stray = device.sendToHome();
+      stray.catch(() => undefined);
+      const verdict = 'Exceeded timeout of 500 ms for a test.';
+      test.errors.push([verdict, undefined]);
+      await (env.handleTestEvent as (event: unknown, state: unknown) => Promise<void>)(
+        { name: 'test_fn_failure', test, error: verdict },
+        {},
+      );
+      expect(test.errors).toEqual([[expect.stringMatching(/^Exceeded timeout of 500 ms for a test\.\n\nInterrupted: sendToHome — backgrounding for \d+ms$/), undefined]]);
+    } finally {
+      await env.teardown();
+    }
+  });
+
   it('a PASSING unit aborts nothing; environment teardown aborts the file scope', async () => {
     const server = await initCompat();
     const env = makeEnvironment();
@@ -270,5 +296,15 @@ describe('scope ↔ explicit-signal composition (either aborts the call)', () =>
     } finally {
       await env.teardown();
     }
+  });
+});
+
+describe('one surface object per name (spec 021)', () => {
+  it('a later copy is handed the first copy\'s object, and the surface is registered under its names', async () => {
+    const { sharedSurface } = await import('../state');
+    const compat = await import('../index');
+    expect(sharedSurface('device', { another: 'copy' })).toBe(compat.device);
+    expect(sharedSurface('element', () => undefined)).toBe(compat.element);
+    expect(Object.keys(box.surface).sort()).toEqual(['by', 'device', 'element', 'expect', 'waitFor']);
   });
 });

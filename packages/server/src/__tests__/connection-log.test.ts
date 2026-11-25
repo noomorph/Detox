@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
 import { describe, it, expect } from 'vitest';
-import { memoryChannel, Peer, DetoxError, DetoxErrorCode } from '@detox-remote/core';
+import { memoryChannel, Peer, DetoxError, DetoxErrorCode, AbortReason } from '@detox-remote/core';
 
 import { ConnectionLog } from '../ConnectionLog';
 import type { LogLine } from '../ConnectionLog';
@@ -485,6 +485,61 @@ describe('ConnectionRecorder — the Peer.observe seam turned into lines', () =>
     expect(last).toMatchObject({ kind: 'end', node: { id: 'conn' }, level: 'info', fields: { ok: true, openHandlers: 0 } });
     expect(h.endedCalls()).toBe(1);
     await h.recorder.ended;
+  });
+
+  it('a cancelled request names why and what it was waiting for on its end line (spec 020)', async () => {
+    const h = harness();
+    let entered: () => void = () => undefined;
+    const running = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    h.server.onRequest({
+      method: 'launchApp',
+      handler: async (_params, ctx) => {
+        ctx.waiting('awaiting-login');
+        entered();
+        await new Promise<void>((resolve) => ctx.signal.addEventListener('abort', () => resolve()));
+        throw new Error('stopped');
+      },
+    });
+    const ac = new AbortController();
+    const call = h.client.request({ method: 'launchApp', signal: ac.signal });
+    await running;
+    ac.abort(new AbortReason('hook-failed'));
+    await expect(call).rejects.toMatchObject({ details: { waiting: { on: 'awaiting-login' } } });
+    const rpcEnd = linesOf(h.file).find((l) => l.kind === 'end' && l.node.id === 'rpc:1');
+    expect(rpcEnd).toMatchObject({
+      level: 'warn',
+      fields: { ok: false, reason: 'hook-failed', waiting: { on: 'awaiting-login', forMs: expect.any(Number) as number } },
+    });
+  });
+
+  it('a line for a connection whose log has closed goes server-rank instead of nowhere (spec 019)', async () => {
+    const h = harness();
+    let late: (() => void) | undefined;
+    h.server.onRequest({
+      method: 'launchApp',
+      // The harness peer has no handler scope of its own; the recorder's is entered by hand.
+      handler: () =>
+        h.recorder.handlerScope({ id: '1' } as never, () => {
+          const trace = currentRequestTrace();
+          late = () => trace?.line('info', 'the app socket closed late', { deviceId: 'udid-1' });
+          return Promise.resolve();
+        }),
+    });
+    await h.client.request({ method: 'launchApp' });
+    late?.();
+    expect(linesOf(h.file).some((l) => l.msg === 'the app socket closed late')).toBe(true);
+
+    const serverRank: string[] = [];
+    serverLog.attachServerFile((_level, message) => serverRank.push(message));
+    try {
+      h.log.close();
+      late?.();
+      expect(serverRank).toEqual(['the app socket closed late']);
+    } finally {
+      serverLog.attachServerFile(undefined);
+    }
   });
 
   it('a request that returns with a child still open closes the child with it (no reason on a live connection)', async () => {
